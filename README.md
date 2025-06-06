@@ -32,6 +32,19 @@ To upraszcza zarządzanie infrastrukturą i tworzy spójne archiwum sprzętu.
 - W przyszłości proponowane jest **zrezygnowanie z haseł** na rzecz logowania wyłącznie przez klucze SSH, co zwiększy bezpieczeństwo i uprości zarządzanie dostępem.
 
 ---
+
+W aktualnym stanie kod wymaga **doróbki w zakresie instalacji oprogramowania SCH oraz konfiguracji systemu pod obsługę technologii Dante**. Obecnie skrypt **NIE** obejmuje:  
+- **Automatycznej instalacji oprogramowania SCH**, które wymaga pobrania z prywatnego repozytorium, aktywacji licencji i konfiguracji plików konfiguracyjnych.  
+- **Instalacji sterowników i bibliotek dla Dante**, które wymagają rejestracji licencji i integracji z systemem operacyjnym.  
+
+W przyszłości należy rozbudować playbook o:  
+- Moduły pobierania i instalacji pakietów specyficznych dla SCH,  
+- Obsługę licencji Dante (np. automatyczne generowanie CSR, pobieranie certyfikatów, konfigurację usług audio),  
+- Testy kompatybilności z wersjami jądra, bibliotekami systemowymi i sprzętem audio.  
+
+Brak tych elementów ogranicza pełną automatyzację i gotowość serwera do pracy w środowiskach wymagających Dante/SCH.
+
+---
 ## **Opis wyjaśniający przeznaczenie pliku**
 ## cloud-init-user-data:
 
