@@ -1,0 +1,414 @@
+---
+- name: Remote BIOS and RAID configuration (Ubuntu 24.04)
+  hosts: SCH
+  gather_facts: yes
+  become: yes
+
+  vars:
+    # Local path to SAA tool on the controller machine
+    local_saa_linux_path: "/opt/iventoy/user/files/saa"
+    # Target remote path for SAA tool
+    remote_saa_linux_path: "/opt/supermicro/saa"
+    # Path to BIOS firmware file locally
+    firmware_file_local: "/opt/iventoy/user/files/bios/BIOS_A2SDICH-0969_20241220_2.2_STDsp.bin"
+    # Remote path for BIOS firmware
+    firmware_file_remote: "{{ remote_saa_linux_path }}/BIOS_A2SDICH-0969_20241220_2.2_STDsp.bin"
+    # Required dependencies for SAA on Ubuntu
+    saa_dependencies:
+      - libssl-dev
+      - libusb-1.0-0-dev
+      - ipmitool
+      - libncurses5-dev
+    # RAID device to create
+    raid_device: /dev/md127
+    # RAID level (RAID 1 in this case)
+    raid_level: 1
+    # Disk devices to use for RAID array
+    raid_devices:
+      - /dev/sdb
+      - /dev/sdc
+    # Mount point for the new RAID device
+    mount_point: /mnt/file_manager
+    # Filesystem type for RAID device
+    fs_type: ext4
+
+  tasks:
+
+    - name: Stop systemd-networkd-wait-online.service
+      systemd:
+        name: systemd-networkd-wait-online.service
+        state: stopped
+      become: yes
+
+    - name: Disable auto-start of systemd-networkd-wait-online.service
+      systemd:
+        name: systemd-networkd-wait-online.service
+        enabled: no
+      become: yes
+
+    - name: Mask systemd-networkd-wait-online.service
+      command: systemctl mask systemd-networkd-wait-online.service
+      become: yes
+
+    - name: Replace Polish mirror with official Ubuntu mirror
+      lineinfile:
+        path: /etc/apt/sources.list
+        regexp: 'pl.archive.ubuntu.com'
+        line: 'deb http://archive.ubuntu.com/ubuntu {{ ansible_distribution_version }} main restricted universe multiverse'
+        backrefs: yes
+      become: yes
+      notify: Update Ubuntu package cache
+
+    - name: Clean outdated APT cache
+      command: apt-get clean
+      become: yes
+      ignore_errors: yes
+
+    - name: Remove local APT cache
+      file:
+        path: "/var/lib/apt/lists"
+        state: absent
+      become: yes
+
+    - name: Create empty APT lists directory
+      file:
+        path: "/var/lib/apt/lists"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+      become: yes
+
+    - name: Update Ubuntu package cache (with retries)
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      become: yes
+      register: apt_update_result
+      until: apt_update_result is success
+      retries: 5
+      delay: 10
+      when: ansible_distribution == 'Ubuntu' and ansible_distribution_version == '24.04'
+
+    - name: Install required packages
+      apt:
+        name:
+          - software-properties-common
+          - mdadm
+          - glances
+          - nano
+          - lm-sensors
+          - htop
+          - iputils-ping
+          - openssh-server
+        state: present
+        update_cache: yes
+      become: yes
+      ignore_errors: yes
+
+    - name: Install SAA dependencies for Ubuntu
+      apt:
+        name: "{{ saa_dependencies }}"
+        state: present
+        force_apt_get: yes
+      become: yes
+      when: ansible_distribution == 'Ubuntu' and ansible_distribution_version == '24.04'
+
+    - name: Check presence of /dev/ipmi0 (Linux)
+      stat:
+        path: "/dev/ipmi0"
+      register: ipmi_device_stat_linux
+      when: ansible_facts.system == 'Linux'
+
+    - name: Check if IPMI kernel modules are loaded
+      shell: lsmod | grep ipmi
+      register: ipmi_modules
+      ignore_errors: yes
+      changed_when: false
+      when: ansible_facts.system == 'Linux'
+
+    - name: Load IPMI kernel modules via modprobe
+      shell: |
+        modprobe ipmi_devintf
+        modprobe ipmi_si
+        modprobe ipmi_msghandler
+      args:
+        executable: /bin/bash
+      become: yes
+      when: >
+        ansible_facts.system == 'Linux' and
+        (ipmi_modules.stdout is not match("ipmi") or ipmi_device_stat_linux.stat.exists == false)
+
+    - name: Check existence of parent dir /opt/supermicro
+      stat:
+        path: "/opt/supermicro"
+      register: supermicro_dir_stat
+      when: ansible_facts.system == 'Linux'
+
+    - name: Create /opt/supermicro if missing
+      file:
+        path: "/opt/supermicro"
+        state: directory
+        mode: "0755"
+        owner: "root"
+        group: "root"
+      become: yes
+      when: >
+        ansible_facts.system == 'Linux' and
+        not supermicro_dir_stat.stat.exists
+
+    - name: Remove old {{ remote_saa_linux_path }} dir (Linux)
+      file:
+        path: "{{ remote_saa_linux_path }}"
+        state: absent
+      become: yes
+      when: ansible_facts.system == 'Linux'
+
+    - name: Create {{ remote_saa_linux_path }} dir (Linux)
+      file:
+        path: "{{ remote_saa_linux_path }}"
+        state: directory
+        mode: "0755"
+        owner: "root"
+        group: "root"
+      become: yes
+      register: saa_dir_result_linux
+      when: ansible_facts.system == 'Linux'
+
+    - name: Confirm existence of {{ remote_saa_linux_path }}
+      stat:
+        path: "{{ remote_saa_linux_path }}"
+      register: saa_dir_check
+      until: saa_dir_check.stat.exists
+      retries: 5
+      delay: 1
+      when: ansible_facts.system == 'Linux'
+
+    - name: Copy SAA_Linux from controller to remote host (Linux)
+      copy:
+        src: "{{ local_saa_linux_path }}/saa"
+        dest: "{{ remote_saa_linux_path }}/"
+        mode: "0755"
+        owner: "root"
+        group: "root"
+        force: yes
+      become: yes
+      register: saa_copy_result_linux
+      when: ansible_facts.system == 'Linux' and saa_dir_check.stat.exists
+
+    - name: Copy BIOS firmware file to remote host
+      copy:
+        src: "{{ firmware_file_local }}"
+        dest: "{{ firmware_file_remote }}"
+        mode: "0644"
+        owner: "root"
+        group: "root"
+      become: yes
+      register: firmware_copy_result
+      when: ansible_facts.system == 'Linux'
+
+    - name: Check if SAA executable exists
+      stat:
+        path: "{{ remote_saa_linux_path }}/saa"
+      register: saa_executable_check
+      when: ansible_facts.system == 'Linux'
+
+    - name: Set executable permissions for SAA binary (Linux)
+      file:
+        path: "{{ remote_saa_linux_path }}/saa"
+        mode: "0755"
+      become: yes
+      register: saa_exec_result_linux
+      when: >
+        ansible_facts.system == 'Linux' and
+        saa_executable_check.stat.exists and
+        saa_copy_result_linux is success
+
+    - name: Update BIOS using SAA (Linux)
+      shell: |
+        cd {{ remote_saa_linux_path }}
+        ./saa -c UpdateBios --file {{ firmware_file_remote }}
+      args:
+        executable: /bin/bash
+        chdir: "{{ remote_saa_linux_path }}"
+      register: saa_update_linux
+      ignore_errors: no
+      no_log: false
+      become: yes
+      when: >
+        ansible_facts.system == 'Linux' and
+        firmware_copy_result is success
+
+    - name: Reboot server after BIOS update
+      reboot:
+        msg: "Rebooting server after BIOS update"
+        reboot_timeout: 600
+      when: saa_update_linux is success
+      become: yes
+
+    - name: Check existence of mount point {{ mount_point }}
+      stat:
+        path: "{{ mount_point }}"
+      register: mount_point_stat
+      changed_when: false
+
+    - name: Unmount existing mount point {{ mount_point }}
+      mount:
+        path: "{{ mount_point }}"
+        state: unmounted
+      when: mount_point_stat.stat.exists
+
+    - name: Delete directory {{ mount_point }}
+      file:
+        path: "{{ mount_point }}"
+        state: absent
+      when: mount_point_stat.stat.exists
+
+    - name: Stop and remove old RAID arrays
+      shell: |
+        for array in $(cat /proc/mdstat | grep -Eo 'md[0-9]+'); do
+          umount "/dev/$array" || true
+          mdadm --stop "/dev/$array" || true
+          mdadm --remove "/dev/$array" || true
+        done
+      become: yes
+      ignore_errors: yes
+
+    - name: Clear superblocks from disks
+      shell: |
+        mdadm --zero-superblock {{ item }} || true
+        wipefs -a {{ item }} || true
+      loop: "{{ raid_devices }}"
+      become: yes
+      ignore_errors: yes
+
+    - name: Reread partition tables
+      shell: |
+        partprobe {{ item }}
+        blockdev --rereadpt {{ item }} || true
+      loop: "{{ raid_devices }}"
+      become: yes
+
+    - name: Create RAID1 array named md127
+      shell: |
+        yes | mdadm --create /dev/md127 \
+          --level=1 \
+          --raid-devices=2 \
+          --metadata=1.2 \
+          --name=127 \
+          {{ raid_devices[0] }} {{ raid_devices[1] }} \
+          --force --assume-clean
+      args:
+        creates: /dev/md127
+      become: yes
+
+    - name: Asynchronous check for RAID sync completion
+      shell: |
+        while grep -E 'resync|recovery|reshape|check' /proc/mdstat > /dev/null; do
+          echo -e "\e[33mRAID synchronization active...\e[0m"
+          cat /proc/mdstat | grep -E 'resync|recovery|reshape|check' | awk '{print "\e[36m" $0 "\e[0m"}'
+          sleep 10
+        done
+        echo -e "\e[32mRAID synchronization complete.\e[0m"
+      async: 3600
+      poll: 10
+      changed_when: false
+
+    - name: Update mdadm.conf with current array details
+      shell: mdadm --detail --scan > /etc/mdadm/mdadm.conf
+      become: yes
+
+    - name: Uncomment DEVICE partitions containers line
+      lineinfile:
+        path: /etc/mdadm/mdadm.conf
+        regexp: '^#DEVICE partitions containers'
+        line: 'DEVICE partitions containers'
+        backrefs: yes
+        create: no
+      become: yes
+
+    - name: Add raid1 module to initramfs
+      lineinfile:
+        path: /etc/initramfs-tools/modules
+        line: raid1
+        create: yes
+        mode: '0644'
+      become: yes
+
+    - name: Update initramfs
+      command: update-initramfs -u -k all
+      become: yes
+
+    - name: Get UUID of RAID device dynamically
+      command: blkid -s UUID -o value /dev/md127
+      register: raid_uuid
+      changed_when: false
+      become: yes
+
+    - name: Update fstab with new UUID
+      lineinfile:
+        path: /etc/fstab
+        regexp: '\s{{ mount_point }}\s'
+        line: "UUID={{ raid_uuid.stdout }} {{ mount_point }} {{ fs_type }} defaults,nofail,x-systemd.device-timeout=30 0 2"
+        create: yes
+        mode: '0644'
+      become: yes
+
+    - name: Create ext4 filesystem
+      filesystem:
+        fstype: "{{ fs_type }}"
+        dev: "{{ raid_device }}"
+
+    - name: Create mount point directory
+      file:
+        path: "{{ mount_point }}"
+        state: directory
+        mode: '0755'
+
+    - name: Set owner and group for {{ mount_point }}
+      file:
+        path: "{{ mount_point }}"
+        owner: player
+        group: player
+        recurse: yes
+      become: yes
+
+    - name: Set permissions for {{ mount_point }}
+      file:
+        path: "{{ mount_point }}"
+        mode: '0755'
+        recurse: yes
+      become: yes
+
+    - name: Update fstab again
+      lineinfile:
+        path: /etc/fstab
+        regexp: '\s{{ mount_point }}\s'
+        line: "UUID={{ raid_uuid.stdout }} {{ mount_point }} {{ fs_type }} defaults,nofail,x-systemd.device-timeout=30 0 2"
+        create: yes
+        mode: '0644'
+      ignore_errors: yes
+
+    - name: Reboot system
+      reboot:
+        msg: "Rebooting to apply RAID changes"
+        reboot_timeout: 600
+
+    - name: Wait for connection after reboot
+      wait_for_connection:
+        timeout: 300
+
+    - name: Check RAID status after reboot
+      shell: cat /proc/mdstat
+      register: mdstat_after_reboot
+      until: "'active raid1' in mdstat_after_reboot.stdout"
+      retries: 20
+      delay: 3
+
+    - name: Print final RAID status
+      debug:
+        msg: "{{ mdstat_after_reboot.stdout }}"
+
+    - name: Final step - power off the host
+      ansible.builtin.command: poweroff
+      become: true

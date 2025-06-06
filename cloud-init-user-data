@@ -1,0 +1,131 @@
+#cloud-config
+# Configuration for Ubuntu Autoinstall using cloud-init
+# This file automates the installation and initial setup of a minimal Ubuntu system
+
+autoinstall:
+  version: 1
+  reboot: true                        # Reboot the system after installation completes
+  minimal_install: true               # Perform a minimal installation (no GUI or extra packages)
+
+  network:
+    version: 2                        # Use Netplan format version 2 for networking
+    ethernets:
+      en:                             # Configure Ethernet interfaces matching 'en*'
+        match:
+          name: en*                   # Match any interface starting with 'en' (Ethernet)
+        dhcp4: true                   # Use DHCPv4 to obtain IPv4 address
+        nameservers:
+          addresses:
+            - 8.8.8.8                 # Primary DNS server (Google)
+            - 8.8.4.4                 # Secondary DNS server (Google)
+
+  user-data:
+    # Commands to run once, during first boot
+    runcmd:
+      - |
+        echo "--- Waiting for network ---"
+        timeout=60                    # Set timeout for waiting on network
+        while ! ping -c 1 8.8.8.8; do # Wait until internet becomes available
+          sleep 1
+          timeout=$((timeout - 1))
+          if [ $timeout -le 0 ]; then
+            echo "Error: Network not available after 60 seconds"
+            exit 1
+          fi
+        done
+      - |
+        IP=$(hostname -I | awk '{print $1}')  # Get primary IP address
+        for i in {1..5}; do                    # Try up to 5 times
+          curl -s -X POST http://192.168.50.1/hook/register -d "{\"ip\": \"$IP\"}" && break || sleep 20
+        done
+        if [ $? -ne 0 ]; then                  # If all attempts failed
+          echo "ERROR: Failed to register client" >&2
+          exit 1
+        fi
+      - |
+        for i in {1..5}; do                    # Try up to 5 times
+          curl -s -X GET http://192.168.50.1/hook/run_playbook && break || sleep 2
+        done
+        if [ $? -ne 0 ]; then                  # If request fails
+          echo "ERROR: Failed to trigger Ansible playbook" >&2
+          exit 1
+        fi
+
+    hostname: soundcorehero           # Set the hostname of the machine
+    locale: en_US.UTF-8               # System locale
+    timezone: Europe/Warsaw           # Timezone setting
+    users:
+      - name: player                  # Create a new user named 'player'
+        gecos: player                 # Full name or description
+        shell: /bin/bash              # Default shell
+        groups: [adm, sudo, dip, plugdev, lxd]  # Additional groups for the user
+        sudo: ALL=(ALL) NOPASSWD:ALL  # Allow passwordless sudo
+        lock_passwd: false            # Password is not locked
+        hashed_passwd: $6$rounds=500000$stpDd90q5q0vox.$B0cLlMNorDOgnbJHN5kuy9jDJHre4NDH6LiDssbxW7HwrKMMvEoifzwlBWLlRE.3fUoN.l8etgCQRAy8EyGaa1
+                                      # SHA-512 hash of password 'player'
+        ssh_authorized_keys:
+          - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDQeU4xpQ27aqRsx07rRWRO15u5zzlldldreZv9Su+D7 PXE-server
+                                      # Allow SSH login without password
+
+  ssh:
+    install-server: true             # Install OpenSSH server
+
+  keyboard:
+    layout: us                       # Keyboard layout (US English)
+
+  packages:
+    - python3                        # Install Python 3
+    - python3-pip                    # Install Python package manager
+    - curl                           # Install cURL utility
+
+  storage:
+    config:
+      - type: disk
+        id: disk0
+        match: { path: /dev/sda }    # Target the main disk at /dev/sda
+        wipe: superblock-recursive   # Clear existing data before partitioning
+        ptable: gpt                  # Use GPT partition table
+
+      - type: partition
+        id: part_esp
+        device: disk0
+        size: 1024M                  # First partition: 1GB for EFI system partition
+        number: 1
+        grub_device: true            # Mark as GRUB bootable
+
+      - type: format
+        id: format_esp
+        volume: part_esp
+        fstype: fat32                # Format ESP as FAT32
+
+      - type: mount
+        id: mount_esp
+        device: format_esp
+        path: /boot/efi              # Mount ESP at /boot/efi
+
+      - type: partition
+        id: part_swap
+        device: disk0
+        size: 2048M                  # Second partition: 2GB for Swap
+        number: 2
+
+      - type: format
+        id: format_swap
+        volume: part_swap
+        fstype: swap                 # Format as Swap
+
+      - type: partition
+        id: part_root
+        device: disk0
+        size: -1                     # Third partition: use remaining space
+        number: 3
+
+      - type: format
+        id: format_root
+        volume: part_root
+        fstype: ext4                 # Format root as ext4
+
+      - type: mount
+        id: mount_root
+        device: format_root
+        path: /                      # Mount root at /
